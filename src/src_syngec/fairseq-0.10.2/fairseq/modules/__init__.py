@@ -33,7 +33,7 @@ from .transformer_sentence_encoder_layer import TransformerSentenceEncoderLayer
 from .transformer_sentence_encoder import TransformerSentenceEncoder
 from .transpose_last import TransposeLast
 from .unfold import unfold1d
-from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer, GATSyntaxGuidedTransformerEncoderLayer, GCNSyntaxGuidedTransformerEncoderLayer, ZYGCNSyntaxGuidedTransformerEncoderLayer, DSATransformerEncoderLayer, SynGECTransformerDecoderLayer
+from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer, GATSyntaxGuidedTransformerEncoderLayer, GCNSyntaxGuidedTransformerEncoderLayer, ZYGCNSyntaxGuidedTransformerEncoderLayer, DSATransformerEncoderLayer, SynGECTransformerDecoderLayer, TransformerDecoderMoeLayer, SyntaxTransformerDecoderMoeLayer
 from .vggblock import VGGBlock
 
 __all__ = [
@@ -70,6 +70,13 @@ __all__ = [
     "TransformerSentenceEncoder",
     "TransformerDecoderLayer",
     "TransformerEncoderLayer",
+    "GATSyntaxGuidedTransformerEncoderLayer",
+    "GCNSyntaxGuidedTransformerEncoderLayer",
+    "ZYGCNSyntaxGuidedTransformerEncoderLayer",
+    "DSATransformerEncoderLayer",
+    "SynGECTransformerDecoderLayer",
+    "TransformerDecoderMoeLayer",
+    "SyntaxTransformerDecoderMoeLayer",
     "TransposeLast",
     "VGGBlock",
     "unfold1d",

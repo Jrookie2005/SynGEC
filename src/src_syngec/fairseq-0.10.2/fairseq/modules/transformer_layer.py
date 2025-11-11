@@ -13,6 +13,22 @@ from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 from torch import Tensor
 
+# FastMoE imports for MoE-based decoder FFN
+try:
+    from fmoe import FMoETransformerMLP  # type: ignore
+    from fmoe.gates import (  # type: ignore
+        NaiveGate,
+        NoisyGate,
+        GShardGate,
+        SwitchGate,
+    )
+    from fmoe.transformer import SyntaxGuidedFMoETransformerMLP
+except Exception:
+    # Allow the rest of the module to be imported even if FastMoE isn't available.
+    FMoETransformerMLP = None  # type: ignore
+    NaiveGate = NoisyGate = GShardGate = SwitchGate = None  # type: ignore
+    SyntaxGuidedFMoETransformerMLP = None  # type: ignore
+
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -1296,7 +1312,571 @@ class SynGECTransformerDecoderLayer(nn.Module):
     def make_generation_fast_(self, need_attn: bool = False, **kwargs):
         self.need_attn = need_attn
 
+class TransformerDecoderMoeLayer(nn.Module):
+    """Decoder layer block with MoE FFN (FastMoE).
 
+    This layer mirrors TransformerDecoderLayer, but replaces the FFN with an
+    MoE MLP implemented by FastMoE (FMoETransformerMLP).
+
+    Required args (with defaults if unspecified):
+      - moe_num_experts (int, default: 4)
+      - moe_top_k (int, default: 1)
+      - moe_gate (str, default: "naive") in {naive, noisy, gshard, switch}
+      - expert_dropout (float, default: args.dropout)
+      - moe_scaling (float, default: 1.0)
+    """
+
+    def __init__(
+        self, args, no_encoder_attn: bool = False, add_bias_kv: bool = False, add_zero_attn: bool = False
+    ):
+        super().__init__()
+        self.embed_dim = args.decoder_embed_dim
+        self.dropout_module = FairseqDropout(
+            args.dropout, module_name=self.__class__.__name__
+        )
+        self.quant_noise = getattr(args, "quant_noise_pq", 0)
+        self.quant_noise_block_size = getattr(args, "quant_noise_pq_block_size", 8)
+
+        self.cross_self_attention = getattr(args, "cross_self_attention", False)
+
+        self.self_attn = self.build_self_attention(
+            self.embed_dim,
+            args,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+        )
+
+        self.activation_fn = utils.get_activation_fn(
+            activation=str(getattr(args, "activation_fn", "relu"))
+        )
+        activation_dropout_p = getattr(args, "activation_dropout", 0)
+        if activation_dropout_p == 0:
+            activation_dropout_p = getattr(args, "relu_dropout", 0)
+        self.activation_dropout_module = FairseqDropout(
+            float(activation_dropout_p), module_name=self.__class__.__name__
+        )
+        self.normalize_before = args.decoder_normalize_before
+
+        export = getattr(args, "char_inputs", False)
+        self.self_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+        if no_encoder_attn:
+            self.encoder_attn = None
+            self.encoder_attn_layer_norm = None
+        else:
+            self.encoder_attn = self.build_encoder_attention(self.embed_dim, args)
+            self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+        # Final layer norm around FFN/MoE block (kept consistent with baseline)
+        self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
+        self.need_attn = True
+        self.onnx_trace = False
+
+        # ---------------- MoE FFN (FastMoE) ----------------
+        if FMoETransformerMLP is None:
+            raise ImportError("FastMoE (fmoe) is required for TransformerDecoderMoeLayer but not found.")
+
+        num_experts = int(getattr(args, "moe_num_experts", 4))
+        top_k = int(getattr(args, "moe_top_k", 1))
+        expert_hidden = int(getattr(args, "decoder_ffn_embed_dim", self.embed_dim * 4))
+        expert_dropout = float(getattr(args, "expert_dropout", getattr(args, "dropout", 0.1)))
+        gate_name = str(getattr(args, "moe_gate", "naive")).lower()
+
+        # pick a gate
+        gate_cls = {
+            "naive": NaiveGate,
+            "noisy": NoisyGate,
+            "gshard": GShardGate,
+            "switch": SwitchGate,
+        }.get(gate_name, NaiveGate)
+
+        activation = nn.Sequential(
+            nn.GELU(),
+            nn.Dropout(expert_dropout),
+        )
+
+        self.moe_ffn = FMoETransformerMLP(
+            num_experts,
+            self.embed_dim,
+            expert_hidden,
+            activation=activation,
+            gate=gate_cls,
+            top_k=top_k
+        )
+
+        self.moe_scaling = float(getattr(args, "moe_scaling", 1.0))
+        self._moe_loss = 0.0
+
+    def build_self_attention(
+        self, embed_dim, args, add_bias_kv: bool = False, add_zero_attn: bool = False
+    ):
+        return MultiheadAttention(
+            embed_dim,
+            args.decoder_attention_heads,
+            dropout=args.attention_dropout,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+            self_attention=not getattr(args, "cross_self_attention", False),
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+        )
+
+    def build_encoder_attention(self, embed_dim, args):
+        return MultiheadAttention(
+            embed_dim,
+            args.decoder_attention_heads,
+            kdim=getattr(args, "encoder_embed_dim", None),
+            vdim=getattr(args, "encoder_embed_dim", None),
+            dropout=args.attention_dropout,
+            encoder_decoder_attention=True,
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+        )
+
+    def prepare_for_onnx_export_(self):
+        self.onnx_trace = True
+
+    def residual_connection(self, x, residual):
+        return residual + x
+
+    def forward(
+        self,
+        x,
+        encoder_out: Optional[torch.Tensor] = None,
+        encoder_padding_mask: Optional[torch.Tensor] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        prev_self_attn_state: Optional[List[torch.Tensor]] = None,
+        prev_attn_state: Optional[List[torch.Tensor]] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_padding_mask: Optional[torch.Tensor] = None,
+        need_attn: bool = False,
+        need_head_weights: bool = False,
+    ):
+        if need_head_weights:
+            need_attn = True
+
+        # ---- Self-Attention ----
+        residual = x
+        if self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+        if prev_self_attn_state is not None:
+            prev_key, prev_value = prev_self_attn_state[:2]
+            saved_state: Dict[str, Optional[Tensor]] = {
+                "prev_key": prev_key,
+                "prev_value": prev_value,
+            }
+            if len(prev_self_attn_state) >= 3:
+                saved_state["prev_key_padding_mask"] = prev_self_attn_state[2]
+            assert incremental_state is not None
+            self.self_attn._set_input_buffer(incremental_state, saved_state)
+        _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+        if self.cross_self_attention and not (
+            incremental_state is not None
+            and _self_attn_input_buffer is not None
+            and "prev_key" in _self_attn_input_buffer
+        ):
+            if self_attn_mask is not None:
+                assert encoder_out is not None
+                self_attn_mask = torch.cat(
+                    (x.new_zeros(x.size(0), encoder_out.size(0)), self_attn_mask), dim=1
+                )
+            if self_attn_padding_mask is not None:
+                if encoder_padding_mask is None:
+                    assert encoder_out is not None
+                    encoder_padding_mask = self_attn_padding_mask.new_zeros(
+                        encoder_out.size(1), encoder_out.size(0)
+                    )
+                self_attn_padding_mask = torch.cat(
+                    (encoder_padding_mask, self_attn_padding_mask), dim=1
+                )
+            assert encoder_out is not None
+            y = torch.cat((encoder_out, x), dim=0)
+        else:
+            y = x
+
+        x, attn = self.self_attn(
+            query=x,
+            key=y,
+            value=y,
+            key_padding_mask=self_attn_padding_mask,
+            incremental_state=incremental_state,
+            need_weights=False,
+            attn_mask=self_attn_mask,
+        )
+        x = self.dropout_module(x)
+        x = self.residual_connection(x, residual)
+        if not self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+
+        # ---- Encoder-Decoder Attention ----
+        if self.encoder_attn is not None and encoder_out is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+            if prev_attn_state is not None:
+                prev_key, prev_value = prev_attn_state[:2]
+                saved_state: Dict[str, Optional[Tensor]] = {
+                    "prev_key": prev_key,
+                    "prev_value": prev_value,
+                }
+                if len(prev_attn_state) >= 3:
+                    saved_state["prev_key_padding_mask"] = prev_attn_state[2]
+                assert incremental_state is not None
+                self.encoder_attn._set_input_buffer(incremental_state, saved_state)
+
+            x, attn = self.encoder_attn(
+                query=x,
+                key=encoder_out,
+                value=encoder_out,
+                key_padding_mask=encoder_padding_mask,
+                incremental_state=incremental_state,
+                static_kv=True,
+                need_weights=need_attn or (not self.training and self.need_attn),
+                need_head_weights=need_head_weights,
+            )
+            x = self.dropout_module(x)
+            x = self.residual_connection(x, residual)
+            if not self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+
+        # ---- MoE FFN ----
+        residual = x
+        if self.normalize_before:
+            x = self.final_layer_norm(x)
+
+        # MoE expects (B, T, C); our x is (T, B, C)
+        x_bt = x.transpose(0, 1)
+        y_bt = self.moe_ffn(x_bt)
+        # Capture MoE aux loss
+        self._moe_loss = getattr(self.moe_ffn.gate, 'aux_loss', 0.0)
+        # Combine with scaling as in common MoE practice
+        y_bt = self.moe_scaling * y_bt
+        y = y_bt.transpose(0, 1)
+
+        y = self.dropout_module(y)
+        x = self.residual_connection(y, residual)
+        if not self.normalize_before:
+            x = self.final_layer_norm(x)
+
+        if self.onnx_trace and incremental_state is not None:
+            saved_state = self.self_attn._get_input_buffer(incremental_state)
+            assert saved_state is not None
+            if self_attn_padding_mask is not None:
+                self_attn_state = [
+                    saved_state["prev_key"],
+                    saved_state["prev_value"],
+                    saved_state["prev_key_padding_mask"],
+                ]
+            else:
+                self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
+            return x, attn, self_attn_state
+        return x, attn, None
+
+    def make_generation_fast_(self, need_attn: bool = False, **kwargs):
+        self.need_attn = need_attn
+    
+class SyntaxTransformerDecoderMoeLayer(nn.Module):
+    """Decoder layer block with MoE FFN (FastMoE).
+
+    This layer mirrors TransformerDecoderLayer, but replaces the FFN with an
+    MoE MLP implemented by FastMoE (FMoETransformerMLP).
+
+    Required args (with defaults if unspecified):
+      - moe_num_experts (int, default: 4)
+      - moe_top_k (int, default: 1)
+      - moe_gate (str, default: "naive") in {naive, noisy, gshard, switch}
+      - expert_dropout (float, default: args.dropout)
+      - moe_scaling (float, default: 1.0)
+    """
+
+    def __init__(
+        self, args, no_encoder_attn: bool = False, add_bias_kv: bool = False, add_zero_attn: bool = False
+    ):
+        super().__init__()
+        self.embed_dim = args.decoder_embed_dim
+        self.dropout_module = FairseqDropout(
+            args.dropout, module_name=self.__class__.__name__
+        )
+        self.quant_noise = getattr(args, "quant_noise_pq", 0)
+        self.quant_noise_block_size = getattr(args, "quant_noise_pq_block_size", 8)
+
+        self.cross_self_attention = getattr(args, "cross_self_attention", False)
+
+        self.self_attn = self.build_self_attention(
+            self.embed_dim,
+            args,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+        )
+
+        self.activation_fn = utils.get_activation_fn(
+            activation=str(getattr(args, "activation_fn", "relu"))
+        )
+        activation_dropout_p = getattr(args, "activation_dropout", 0)
+        if activation_dropout_p == 0:
+            activation_dropout_p = getattr(args, "relu_dropout", 0)
+        self.activation_dropout_module = FairseqDropout(
+            float(activation_dropout_p), module_name=self.__class__.__name__
+        )
+        self.normalize_before = args.decoder_normalize_before
+
+        export = getattr(args, "char_inputs", False)
+        self.self_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+        if no_encoder_attn:
+            self.encoder_attn = None
+            self.encoder_attn_layer_norm = None
+        else:
+            self.encoder_attn = self.build_encoder_attention(self.embed_dim, args)
+            self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+        # Syntax-aware cross-attention used to align syntax encoder outputs with decoder time steps
+        self.syntax_cross_attn = self.build_encoder_attention(self.embed_dim, args)
+        self.syntax_cross_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
+
+        # Final layer norm around FFN/MoE block (kept consistent with baseline)
+        self.final_layer_norm = LayerNorm(self.embed_dim, export=export)
+        self.need_attn = True
+        self.onnx_trace = False
+
+        # ---------------- MoE FFN (FastMoE) ----------------
+        if FMoETransformerMLP is None:
+            raise ImportError("FastMoE (fmoe) is required for TransformerDecoderMoeLayer but not found.")
+
+        num_experts = int(getattr(args, "moe_num_experts", 4))
+        top_k = int(getattr(args, "moe_top_k", 1))
+        expert_hidden = int(getattr(args, "decoder_ffn_embed_dim", self.embed_dim * 4))
+        expert_dropout = float(getattr(args, "expert_dropout", getattr(args, "dropout", 0.1)))
+        gate_name = str(getattr(args, "moe_gate", "naive")).lower()
+
+        # pick a gate
+        gate_cls = {
+            "naive": NaiveGate,
+            "noisy": NoisyGate,
+            "gshard": GShardGate,
+            "switch": SwitchGate,
+        }.get(gate_name, NaiveGate)
+        gate_args = {}
+
+        activation = nn.Sequential(
+            nn.GELU(),
+            nn.Dropout(expert_dropout),
+        )
+
+        self.moe_ffn = SyntaxGuidedFMoETransformerMLP(
+            num_experts,
+            self.embed_dim,
+            expert_hidden,
+            activation=activation,
+            gate=gate_cls,
+            top_k=top_k
+        )
+
+        self.moe_scaling = float(getattr(args, "moe_scaling", 1.0))
+        self._moe_loss = 0.0
+
+    def build_self_attention(
+        self, embed_dim, args, add_bias_kv: bool = False, add_zero_attn: bool = False
+    ):
+        return MultiheadAttention(
+            embed_dim,
+            args.decoder_attention_heads,
+            dropout=args.attention_dropout,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+            self_attention=not getattr(args, "cross_self_attention", False),
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+        )
+
+    def build_encoder_attention(self, embed_dim, args):
+        return MultiheadAttention(
+            embed_dim,
+            args.decoder_attention_heads,
+            kdim=getattr(args, "encoder_embed_dim", None),
+            vdim=getattr(args, "encoder_embed_dim", None),
+            dropout=args.attention_dropout,
+            encoder_decoder_attention=True,
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+        )
+
+    def prepare_for_onnx_export_(self):
+        self.onnx_trace = True
+
+    def residual_connection(self, x, residual):
+        return residual + x
+
+    def forward(
+        self,
+        x,
+        encoder_out: Optional[torch.Tensor] = None,
+        encoder_padding_mask: Optional[torch.Tensor] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        prev_self_attn_state: Optional[List[torch.Tensor]] = None,
+        prev_attn_state: Optional[List[torch.Tensor]] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_padding_mask: Optional[torch.Tensor] = None,
+        need_attn: bool = False,
+        need_head_weights: bool = False,
+        syntax_info: Optional[torch.Tensor] = None,
+    ):
+        if need_head_weights:
+            need_attn = True
+
+        # ---- Self-Attention ----
+        residual = x
+        if self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+        if prev_self_attn_state is not None:
+            prev_key, prev_value = prev_self_attn_state[:2]
+            saved_state: Dict[str, Optional[Tensor]] = {
+                "prev_key": prev_key,
+                "prev_value": prev_value,
+            }
+            if len(prev_self_attn_state) >= 3:
+                saved_state["prev_key_padding_mask"] = prev_self_attn_state[2]
+            assert incremental_state is not None
+            self.self_attn._set_input_buffer(incremental_state, saved_state)
+        _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)
+        if self.cross_self_attention and not (
+            incremental_state is not None
+            and _self_attn_input_buffer is not None
+            and "prev_key" in _self_attn_input_buffer
+        ):
+            if self_attn_mask is not None:
+                assert encoder_out is not None
+                self_attn_mask = torch.cat(
+                    (x.new_zeros(x.size(0), encoder_out.size(0)), self_attn_mask), dim=1
+                )
+            if self_attn_padding_mask is not None:
+                if encoder_padding_mask is None:
+                    assert encoder_out is not None
+                    encoder_padding_mask = self_attn_padding_mask.new_zeros(
+                        encoder_out.size(1), encoder_out.size(0)
+                    )
+                self_attn_padding_mask = torch.cat(
+                    (encoder_padding_mask, self_attn_padding_mask), dim=1
+                )
+            assert encoder_out is not None
+            y = torch.cat((encoder_out, x), dim=0)
+        else:
+            y = x
+
+        x, attn = self.self_attn(
+            query=x,
+            key=y,
+            value=y,
+            key_padding_mask=self_attn_padding_mask,
+            incremental_state=incremental_state,
+            need_weights=False,
+            attn_mask=self_attn_mask,
+        )
+        x = self.dropout_module(x)
+        x = self.residual_connection(x, residual)
+        if not self.normalize_before:
+            x = self.self_attn_layer_norm(x)
+
+        # ---- Encoder-Decoder Attention ----
+        if self.encoder_attn is not None and encoder_out is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+            if prev_attn_state is not None:
+                prev_key, prev_value = prev_attn_state[:2]
+                saved_state: Dict[str, Optional[Tensor]] = {
+                    "prev_key": prev_key,
+                    "prev_value": prev_value,
+                }
+                if len(prev_attn_state) >= 3:
+                    saved_state["prev_key_padding_mask"] = prev_attn_state[2]
+                assert incremental_state is not None
+                self.encoder_attn._set_input_buffer(incremental_state, saved_state)
+
+            x, attn = self.encoder_attn(
+                query=x,
+                key=encoder_out,
+                value=encoder_out,
+                key_padding_mask=encoder_padding_mask,
+                incremental_state=incremental_state,
+                static_kv=True,
+                need_weights=need_attn or (not self.training and self.need_attn),
+                need_head_weights=need_head_weights,
+            )
+            x = self.dropout_module(x)
+            x = self.residual_connection(x, residual)
+            if not self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+
+        # ---- MoE FFN ----
+        residual = x
+        if self.normalize_before:
+            x = self.final_layer_norm(x)
+
+        # MoE expects (B, T, C); our x is (T, B, C)
+        x_bt = x.transpose(0, 1)
+        gate_input = x
+        if syntax_info is not None:
+            syntax_hidden = syntax_info.encoder_out if hasattr(syntax_info, "encoder_out") else syntax_info
+            syntax_padding_mask = getattr(syntax_info, "encoder_padding_mask", None)
+            if syntax_padding_mask is None and isinstance(syntax_info, list) and len(syntax_info) > 0:
+                syntax_padding_mask = getattr(syntax_info[0], "encoder_padding_mask", None)
+            if isinstance(syntax_hidden, list):
+                # Normalize list inputs, allowing EncoderOut instances or raw tensors
+                normalized = []
+                for item in syntax_hidden:
+                    if hasattr(item, "encoder_out"):
+                        normalized.append(item.encoder_out)
+                    else:
+                        normalized.append(item)
+                syntax_hidden = None if len(normalized) == 0 else torch.stack(normalized, dim=0).mean(dim=0)
+            if syntax_hidden is not None:
+                # Align syntax representations to decoder time steps via cross-attention
+                gate_query = gate_input
+                if self.normalize_before:
+                    gate_query = self.syntax_cross_attn_layer_norm(gate_query)
+
+                syntax_attn_out, _ = self.syntax_cross_attn(
+                    query=gate_query,
+                    key=syntax_hidden,
+                    value=syntax_hidden,
+                    key_padding_mask=syntax_padding_mask,
+                )
+                if not self.normalize_before:
+                    syntax_attn_out = self.syntax_cross_attn_layer_norm(syntax_attn_out)
+                gate_input = syntax_attn_out
+
+        gate_bt = gate_input.transpose(0, 1)
+        y_bt = self.moe_ffn(expert_input = x_bt, gate_input = gate_bt)
+        # Capture MoE aux loss
+        self._moe_loss = getattr(self.moe_ffn.gate, 'aux_loss', 0.0)
+        # Combine with scaling as in common MoE practice
+        y_bt = self.moe_scaling * y_bt
+        y = y_bt.transpose(0, 1)
+
+        y = self.dropout_module(y)
+        x = self.residual_connection(y, residual)
+        if not self.normalize_before:
+            x = self.final_layer_norm(x)
+
+        if self.onnx_trace and incremental_state is not None:
+            saved_state = self.self_attn._get_input_buffer(incremental_state)
+            assert saved_state is not None
+            if self_attn_padding_mask is not None:
+                self_attn_state = [
+                    saved_state["prev_key"],
+                    saved_state["prev_value"],
+                    saved_state["prev_key_padding_mask"],
+                ]
+            else:
+                self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
+            return x, attn, self_attn_state
+        return x, attn, None
+
+    def make_generation_fast_(self, need_attn: bool = False, **kwargs):
+        self.need_attn = need_attn
+   
+    
 def Linear(in_features, out_features, bias=True):
     m = nn.Linear(in_features, out_features, bias)
     nn.init.xavier_uniform_(m.weight)

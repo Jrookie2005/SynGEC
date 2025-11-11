@@ -376,19 +376,26 @@ def _upgrade_state_dict(state):
         state["optimizer_history"] = [
             {"criterion_name": "CrossEntropyCriterion", "best_loss": state["best_loss"]}
         ]
-        state["last_optimizer_state"] = state["optimizer"]
-        del state["optimizer"]
-        del state["best_loss"]
+        # 关键修改：判断 optimizer 是否存在
+        if "optimizer" in state:
+            state["last_optimizer_state"] = state["optimizer"]
+            del state["optimizer"]
+        else:
+            # 没有 optimizer 时，初始化空的 last_optimizer_state（不影响后续重置）
+            state["last_optimizer_state"] = None
+        # 加判断避免 best_loss 不存在
+        if "best_loss" in state:
+            del state["best_loss"]
     # move extra_state into sub-dictionary
     if "epoch" in state and "extra_state" not in state:
         state["extra_state"] = {
-            "epoch": state["epoch"],
-            "batch_offset": state["batch_offset"],
-            "val_loss": state["val_loss"],
+            "epoch": state.get("epoch", 1),  # 默认为第 1 个 epoch
+            "batch_offset": state.get("batch_offset", 0),  # 默认为 0（从该 epoch 起始处开始）
+            "val_loss": state.get("val_loss", None),  # 默认为 None
         }
-        del state["epoch"]
-        del state["batch_offset"]
-        del state["val_loss"]
+        for key in ["epoch", "batch_offset", "val_loss"]:
+            if key in state:
+                del state[key]
     # reduce optimizer history's memory usage (only keep the last state)
     if "optimizer" in state["optimizer_history"][-1]:
         state["last_optimizer_state"] = state["optimizer_history"][-1]["optimizer"]

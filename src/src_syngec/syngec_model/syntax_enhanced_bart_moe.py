@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from fairseq import utils
 from fairseq.models import register_model, register_model_architecture
-from .syntax_enhanced_transformer import SyntaxEnhancedTransformerModel, syntax_enhanced_transformer, syntax_enhanced_transformer_big
 from .syntax_enhanced_transformer_moe import SyntaxEnhancedMoeTransformerModel
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from .hub_interface import BARTHubInterface
@@ -22,8 +21,10 @@ from .hub_interface import BARTHubInterface
 logger = logging.getLogger(__name__)
 
 
-@register_model("syntax_enhanced_bart")
-class SyntaxEnhancedBARTModel(SyntaxEnhancedTransformerModel):
+
+
+@register_model("syntax_enhanced_bart_moe")
+class SyntaxEnhancedBARTMoeModel(SyntaxEnhancedMoeTransformerModel):
     @classmethod
     def hub_models(cls):
         return {
@@ -44,7 +45,7 @@ class SyntaxEnhancedBARTModel(SyntaxEnhancedTransformerModel):
 
     @staticmethod
     def add_args(parser):
-        super(SyntaxEnhancedBARTModel, SyntaxEnhancedBARTModel).add_args(parser)
+        super(SyntaxEnhancedBARTMoeModel, SyntaxEnhancedBARTMoeModel).add_args(parser)
         parser.add_argument(
             "--pooler-dropout",
             type=float,
@@ -65,6 +66,7 @@ class SyntaxEnhancedBARTModel(SyntaxEnhancedTransformerModel):
             "--freeze-bart-parameters",
             action="store_true"
         )
+
         parser.add_argument(
             "--max-sentence-length",
             type=int
@@ -73,7 +75,6 @@ class SyntaxEnhancedBARTModel(SyntaxEnhancedTransformerModel):
     @property
     def supported_targets(self):
         return {"self"}
-
 
     @classmethod
     def from_pretrained(
@@ -389,7 +390,6 @@ class SyntaxEnhancedBARTModel(SyntaxEnhancedTransformerModel):
                     logger.info("Overwriting", prefix + "classification_heads." + k)
                     state_dict[prefix + "classification_heads." + k] = v
 
-
 class BARTClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
 
@@ -420,9 +420,8 @@ class BARTClassificationHead(nn.Module):
         x = self.out_proj(x)
         return x
 
-
-@register_model_architecture("syntax_enhanced_bart", "syntax_enhanced_bart_large")
-def bart_large_architecture(args):
+@register_model_architecture("syntax_enhanced_bart_moe", "syntax_enhanced_bart_moe_large")
+def syntax_enhanced_bart_moe_large_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4 * 1024)
@@ -464,15 +463,17 @@ def bart_large_architecture(args):
     args.activation_fn = getattr(args, "activation_fn", "gelu")
     args.pooler_activation_fn = getattr(args, "pooler_activation_fn", "tanh")
     args.pooler_dropout = getattr(args, "pooler_dropout", 0.0)
-    syntax_enhanced_transformer(args)
+    from .syntax_enhanced_transformer_moe import syntax_enhanced_transformer_moe
+    syntax_enhanced_transformer_moe(args)
 
 
-@register_model_architecture("syntax_enhanced_bart", "syntax_enhanced_bart_base")
-def bart_base_architecture(args):
+@register_model_architecture("syntax_enhanced_bart_moe", "syntax_enhanced_bart_moe_base")
+def syntax_enhanced_bart_moe_base_architecture(args):
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4 * 768)
     args.encoder_layers = getattr(args, "encoder_layers", 6)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 12)
     args.decoder_layers = getattr(args, "decoder_layers", 6)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 12)
-    bart_large_architecture(args)
+    syntax_enhanced_bart_moe_large_architecture(args)
+
