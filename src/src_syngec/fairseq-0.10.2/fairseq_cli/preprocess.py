@@ -125,7 +125,8 @@ def main(args):
         tgt_dict.save(dict_path(args.target_lang))
     if label_dict is not None:
         for i, d in enumerate(label_dict):
-            d.save(dict_path(f"label{i}"))
+            suffix = "" if len(label_dict) == 1 else str(i)
+            d.save(dict_path(f"label{suffix}"))
 
     def make_binary_dataset(vocab, input_prefix, output_prefix, lang, num_workers, already_numberized=False, append_eos=True):
         logger.info("[{}] Dictionary: {} types".format(lang, len(vocab)))
@@ -394,7 +395,9 @@ def main(args):
                     raise FileExistsError
         if args.testpref:
             for suffix in suffixs:
-                test_src_file = args.testpref.replace("bpe", suffix) + ".src"
+                print("DEBUG:", suffix)
+                test_src_file = args.testpref.replace("char", suffix) + ".src"
+                print("DEBUG:", test_src_file)
                 if os.path.exists(test_src_file):
                     output_prefix = f"test.{suffix}"
                     make_binary_matrix_dataset(

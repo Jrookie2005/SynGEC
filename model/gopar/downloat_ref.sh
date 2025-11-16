@@ -1,0 +1,1 @@
+huggingface-cli download --resume-download hfl/chinese-electra-180g-large-discriminator --local-dir hfl/chinese-electra-180g-large-discriminator
