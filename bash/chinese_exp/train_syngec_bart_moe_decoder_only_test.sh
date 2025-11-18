@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u $FAIRSEQ_CLI_PATH/train.py $PROCESSED_DIR
     --syntax-encoder GCN \
     --use-moe-decoder \
     --moe-num-experts 4 \
-    --moe-gate SwitchGate \
+    --moe-gate switch \
     --top-k 2 \
     --load-balancing-loss-weight 0.02 \
     --expert-dropout 0.15 \

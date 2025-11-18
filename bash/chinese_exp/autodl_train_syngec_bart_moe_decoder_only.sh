@@ -7,10 +7,10 @@
 
 SEED=2022
 FAIRSEQ_CLI_PATH=../../src/src_syngec/fairseq-0.10.2/fairseq_cli
-MODEL_DIR=../../model/syngec_chinese_bart_moe_decoder_only/
-PROCESSED_DIR=../../preprocess/chinese_hsk+lang8_with_syntax_transformer
+MODEL_DIR=/root/autodl-tmp/model/syngec_chinese_bart_moe_decoder_only/
+PROCESSED_DIR=/root/autodl-tmp/preprocess/chinese_hsk+lang8_with_syntax_transformer
 FAIRSEQ_PATH=../../src/src_syngec/fairseq-0.10.2/fairseq
-BART_PATH=../../model/syngec/syngec_chinese_bart_moe_baseline.pt
+BART_PATH=/root/autodl-tmp/syngec/syngec_chinese_bart_moe_baseline.pt
 
 mkdir -p $MODEL_DIR
 mkdir -p $MODEL_DIR/src
@@ -45,7 +45,7 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u $FAIRSEQ_CLI_PATH/train.py $PROCESSED_DIR
     --task syntax-enhanced-translation \
     --arch syntax_enhanced_bart_moe_large \
     --skip-invalid-size-inputs-valid-test \
-    --max-tokens 2048 \
+    --max-tokens 4096 \
     --optimizer adam \
     --update-freq 1 \
     --max-source-positions 512 \
