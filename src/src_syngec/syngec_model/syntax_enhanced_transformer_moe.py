@@ -231,6 +231,10 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')  # 主要用于模型压缩
 
+        # if fuse syntax and sentence output
+        parser.add_argument('--fuse-syntax-sentence-output', action='store_true',
+                            help='whether to have separate outputs for syntax and sentence representations')
+        
         # Moe Args
         parser.add_argument('--use-moe-decoder', action='store_true',
                             help='whether to use MoE in the decoder')
@@ -389,7 +393,7 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
                 if "expert" in name.lower() and "gate" not in name.lower():
                     param.requires_grad = False
         
-        # if getattr(args, "freeze_moe_gates", False):
+        if getattr(args, "freeze_moe_gates", False):
             for name, param in decoder.named_parameters():
                 if "gate" in name.lower():
                     param.requires_grad = False
@@ -761,8 +765,11 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
                             src_lengths=None,
                         )
                         syntax_encoder_out_all.append(res)  
-            encoder_out = self.sen_syn(sentence_encoder_out, syntax_encoder_out_all)  # 聚集操作，保留原始sentence encoder的信息
-            # encoder_out = (sentence_encoder_out, syntax_encoder_out_all)
+            if self.args.fuse_syntax_sentence_output:
+                encoder_out = self.dual_aggregation(sentence_encoder_out, syntax_encoder_out_all, beta=self.args.syntax_sentence_fuse_beta)  # 融合操作
+            else:
+                encoder_out = self.sen_syn(sentence_encoder_out, syntax_encoder_out_all)  # 分离操作，便于后续moe gate设计
+                # encoder_out = (sentence_encoder_out, syntax_encoder_out_all)
             return encoder_out
         else:
             return sentence_encoder_out
@@ -1504,7 +1511,7 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
         if self.args.cross_syntax_fuse:
             return SynGECTransformerDecoderLayer(args, no_encoder_attn)
         elif getattr(args, 'moe_num_experts', 0) > 0 or getattr(args, 'use_moe_decoder', False):
-            if idx == 0:
+            if idx == 0 and not self.args.fuse_syntax_sentence_output:
                 return SyntaxTransformerDecoderMoeLayer(args, no_encoder_attn)
             else:
                 return TransformerDecoderMoeLayer(args, no_encoder_attn)
