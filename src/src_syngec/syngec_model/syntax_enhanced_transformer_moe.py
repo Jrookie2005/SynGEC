@@ -389,7 +389,7 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
                 if "expert" in name.lower() and "gate" not in name.lower():
                     param.requires_grad = False
         
-        # if getattr(args, "freeze_moe_gates", False):
+        if getattr(args, "freeze_moe_gates", False):
             for name, param in decoder.named_parameters():
                 if "gate" in name.lower():
                     param.requires_grad = False
@@ -768,7 +768,7 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
             return sentence_encoder_out
  
     @torch.jit.export
-    def reorder_encoder_out(self, encoder_out, new_order):
+    def reorder_encoder_out(self, encoder_out: EncoderOut, new_order):
         """
         Reorder encoder output according to *new_order*.
 
@@ -779,26 +779,22 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
         Returns:
             *encoder_out* rearranged according to *new_order*
         """
-        if isinstance(encoder_out, tuple) and len(encoder_out) == 2:
-            sentence_encoder_out, syntax_encoder_out = encoder_out
-            reordered_sentence = self.reorder_single_encoder_out(sentence_encoder_out, new_order)
-            reordered_syntax = self.reorder_single_encoder_out(syntax_encoder_out, new_order)
-            return (reordered_sentence, reordered_syntax)
-        else:
-            return self.reorder_single_encoder_out(encoder_out, new_order)
-
-    def reorder_single_encoder_out(self, encoder_out: EncoderOut, new_order):
         """
-        Reorder a single EncoderOut according to *new_order*.
+        Since encoder_padding_mask and encoder_embedding are both of type
+        Optional[Tensor] in EncoderOut, they need to be copied as local
+        variables for Torchscript Optional refinement
         """
+        print("use reorder_encoder_out")
         encoder_padding_mask: Optional[Tensor] = encoder_out.encoder_padding_mask
         encoder_embedding: Optional[Tensor] = encoder_out.encoder_embedding
 
-        new_encoder_out = (
-            encoder_out.encoder_out
-            if encoder_out.encoder_out is None
-            else encoder_out.encoder_out.index_select(1, new_order)
-        )
+        if encoder_out.encoder_out is None:
+            new_encoder_out = (encoder_out.encoder_out)
+        elif isinstance(encoder_out.encoder_out, list):
+            new_encoder_out = ([eo.index_select(1, new_order) for eo in encoder_out.encoder_out])
+        else:
+            new_encoder_out = (encoder_out.encoder_out.index_select(1, new_order))
+
         new_encoder_padding_mask = (
             encoder_padding_mask
             if encoder_padding_mask is None
@@ -1658,8 +1654,8 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
             # Unpack encoder_out if it's a tuple
             syntax_info = None
             if isinstance(encoder_out[0], EncoderOut):
-                # print(f"decoder layer{idx} encoder_out is tuple of EncoderOut")
-                # print('len of encoder_out tuple:', len(encoder_out))
+                print(f"decoder layer{idx} encoder_out is tuple of EncoderOut")
+                print('len of encoder_out tuple:', len(encoder_out))
                 sentence_encoder_out, syntax_encoder_out_all = encoder_out
                 encoder_out = sentence_encoder_out
                 syntax_info = syntax_encoder_out_all
@@ -1884,4 +1880,4 @@ def syntax_enhanced_transformer_moe_big(args):
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
     args.dropout = getattr(args, "dropout", 0.3)
-    syntax_enhanced_transformer_moe(args)
+    syntax_enhanced_transformer(args)
