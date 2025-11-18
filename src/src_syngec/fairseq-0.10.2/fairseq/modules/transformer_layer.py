@@ -1643,8 +1643,6 @@ class SyntaxTransformerDecoderMoeLayer(nn.Module):
         self.onnx_trace = False
 
         # ---------------- MoE FFN (FastMoE) ----------------
-        if FMoETransformerMLP is None:
-            raise ImportError("FastMoE (fmoe) is required for TransformerDecoderMoeLayer but not found.")
 
         num_experts = int(getattr(args, "moe_num_experts", 4))
         top_k = int(getattr(args, "moe_top_k", 1))

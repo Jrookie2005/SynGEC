@@ -5,6 +5,7 @@
 2. decoder：
 + 使用fmoe，将原来的ffn层替换为moe层，初始化expert权重使用baseline的ffn权重
 + layer0的gate使用syntax encoder输出，为了匹配维度，进行了一次cross-attention；，expert使用sentence encoder输出。
+    + 具体见fmoe.transformer.SyntaxGuidedFMoETransformerMLP 
 + layer1-11的gate和expert均使用和sentence encoder输出。
 
 baseline:
