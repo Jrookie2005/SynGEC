@@ -32,8 +32,7 @@ from fairseq.modules import (
     DSATransformerEncoderLayer,
     GradMultiply,
     SynGECTransformerDecoderLayer,
-    TransformerDecoderMoeLayer,
-    SyntaxTransformerDecoderMoeLayer
+    TransformerDecoderMoeLayer
 )
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
@@ -42,36 +41,9 @@ from torch import Tensor
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
 
-def check_nested_lists_in_param_groups(param_groups):
-    """检查参数组中是否存在嵌套列表"""
-    has_nested = False
-    for group_idx, group in enumerate(param_groups):
-        # 获取当前组的参数列表
-        params = group.get('params', [])
-        if not isinstance(params, (list, tuple)):
-            print(f"参数组 {group_idx} 的 'params' 不是列表/元组，类型为: {type(params)}")
-            has_nested = True
-            continue
-        
-        # 检查每个参数是否为列表/元组（即嵌套）
-        for param_idx, param in enumerate(params):
-            if isinstance(param, (list, tuple)):
-                print(f"参数组 {group_idx}（名称: {group.get('name')}）的第 {param_idx} 个元素是嵌套列表/元组，长度: {len(param)}")
-                has_nested = True
-                # 可选：进一步检查嵌套列表中的元素类型
-                for sub_idx, sub_param in enumerate(param):
-                    if not isinstance(sub_param, (torch.Tensor, torch.nn.Parameter)):
-                        print(f"  嵌套元素 {sub_idx} 不是参数，类型为: {type(sub_param)}")
-            elif not isinstance(param, (torch.Tensor, torch.nn.Parameter)):
-                print(f"参数组 {group_idx} 的第 {param_idx} 个元素不是参数，类型为: {type(param)}")
-                has_nested = True
-    
-    if not has_nested:
-        print("参数组中未发现嵌套列表，所有元素均为参数对象")
-    return has_nested
 
-@register_model("syntax_enhanced_transformer_moe")
-class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
+@register_model("syntax_moe_transformer")
+class SyntaxMoeTransformerModel(FairseqEncoderDecoderModel):
     """
     Transformer model from `"Attention Is All You Need" (Vaswani, et al, 2017)
     <https://arxiv.org/abs/1706.03762>`_.
@@ -230,63 +202,14 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
                             help='block size of quantization noise at training time')
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')  # 主要用于模型压缩
-
-        # Moe Args
-        parser.add_argument('--use-moe-decoder', action='store_true',
-                            help='whether to use MoE in the decoder')
-        parser.add_argument('--moe-num-experts', type=int, default=0,
-                            help='number of experts in MoE layers')
-        parser.add_argument('--top-k', type=int, default=1,
-                            help='top k experts to use in MoE layers')
-        parser.add_argument('--moe-gate', type=str, default='naive',
-                            help='type of gate to use in MoE layers(naive, noisy, gshard, switch)')
-        parser.add_argument('--moe-scaling', type=float, default=1.0,
-                            help='scaling factor for MoE layers')
-        
-        # Enhanced Freezing and Learning Rate Control Args
-        parser.add_argument('--freeze-encoder-parameters', action='store_true',
-                            help='freeze all encoder parameters (sentence + syntax)')
-        parser.add_argument('--freeze-sentence-encoder', action='store_true',
-                            help='freeze sentence encoder parameters')
-        parser.add_argument('--freeze-syntax-encoder', action='store_true',
-                            help='freeze syntax encoder parameters')
-        parser.add_argument('--moe-gate-lr-scale', type=float, default=1.0,
-                            help='learning rate scale for MoE gate parameters')
-        parser.add_argument('--expert-lr-scale', type=float, default=1.0,
-                            help='learning rate scale for MoE expert parameters')
-        parser.add_argument('--syntax-encoder-lr-scale', type=float, default=1.0,
-                            help='learning rate scale for syntax encoder parameters')
-        parser.add_argument('--load-balancing-loss-weight', type=float, default=0.0,
-                            help='weight for load balancing loss in MoE')
-        parser.add_argument('--expert-dropout', type=float, default=0.0,
-                            help='dropout rate for MoE experts')
-        parser.add_argument('--moe-gate-warmup-epochs', type=int, default=0,
-                            help='number of epochs to warm up MoE gates')
-        parser.add_argument('--decoder-moe-only', action='store_true',
-                            help='only train decoder MoE parameters')
-        parser.add_argument('--train-moe-only', action='store_true',
-                            help='only train MoE gate and expert parameters')
-        parser.add_argument('--freeze-moe-experts', action='store_true',
-                            help='freeze MoE expert parameters')
-        parser.add_argument('--freeze-moe-gates', action='store_true',
-                            help='freeze MoE gate parameters')
-        parser.add_argument('--freeze-decoder-attention', action='store_true',
-                            help='freeze decoder attention parameters')
-        parser.add_argument('--freeze-decoder-layernorm', action='store_true',
-                            help='freeze decoder layer norm parameters')
-        parser.add_argument('--freeze-embeddings', action='store_true',
-                            help='freeze embedding parameters')
-        
-        # lr scheduler args
-        
         # fmt: on
-        
+
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
 
         # make sure all arguments are present in older models
-        syntax_enhanced_transformer_moe(args)
+        syntax_enhanced_transformer(args)
 
         if args.encoder_layers_to_keep:  # 可以只使用一些特定的layer
             args.encoder_layers = len(args.encoder_layers_to_keep.split(","))
@@ -328,13 +251,10 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
                 args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
         syntax_label_embed_tokens = None
-        
         if args.use_syntax:
-            print(syntax_label_dict)
             if len(syntax_label_dict) > 1:
                 syntax_label_embed_tokens = []
                 for d in syntax_label_dict:
-                    print(d)
                     syntax_label_embed_tokens.append(cls.build_embedding(
                         args, d, args.encoder_embed_dim
                     ))
@@ -345,82 +265,12 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
 
         encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, syntax_label_dict, syntax_label_embed_tokens)
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
-        
-        # Apply parameter freezing based on args
         if getattr(args, "freeze_bart_parameters", False):
             for name, param in encoder.named_parameters():
                 if "sentence_encoder" in name:
                     param.requires_grad = False
             for name, param in decoder.named_parameters():
                 param.requires_grad = False
-        
-        # Enhanced freezing controls
-        if getattr(args, "freeze_encoder_parameters", False):
-            for name, param in encoder.named_parameters():
-                param.requires_grad = False
-        
-        if getattr(args, "freeze_sentence_encoder", False):
-            for name, param in encoder.named_parameters():
-                if "sentence_encoder" in name:
-                    param.requires_grad = False
-        
-        if getattr(args, "freeze_syntax_encoder", False):
-            for name, param in encoder.named_parameters():
-                if "syntax_encoder" in name:
-                    param.requires_grad = False
-        
-        # Decoder-specific freezing
-        if getattr(args, "decoder_moe_only", False):
-            for name, param in encoder.named_parameters():
-                param.requires_grad = False
-            for name, param in decoder.named_parameters():
-                if not ("moe" in name.lower() or "expert" in name.lower() or "gate" in name.lower()):
-                    param.requires_grad = False
-        
-        if getattr(args, "train_moe_only", False):
-            for name, param in encoder.named_parameters():
-                param.requires_grad = False
-            for name, param in decoder.named_parameters():
-                if not ("moe" in name.lower() or "expert" in name.lower() or "gate" in name.lower()):
-                    param.requires_grad = False
-        
-        if getattr(args, "freeze_moe_experts", False):
-            for name, param in decoder.named_parameters():
-                if "expert" in name.lower() and "gate" not in name.lower():
-                    param.requires_grad = False
-        
-        # if getattr(args, "freeze_moe_gates", False):
-            for name, param in decoder.named_parameters():
-                if "gate" in name.lower():
-                    param.requires_grad = False
-        
-        if getattr(args, "freeze_decoder_attention", False):
-            for name, param in decoder.named_parameters():
-                if "attn" in name.lower() and "moe" not in name.lower():
-                    param.requires_grad = False
-        
-        if getattr(args, "freeze_decoder_layernorm", False):
-            for name, param in decoder.named_parameters():
-                if "layer_norm" in name.lower() or "layernorm" in name.lower():
-                    param.requires_grad = False
-        
-        if getattr(args, "freeze_embeddings", False):
-            for name, param in encoder.named_parameters():
-                if "embed" in name.lower():
-                    param.requires_grad = False
-            for name, param in decoder.named_parameters():
-                if "embed" in name.lower():
-                    param.requires_grad = False
-
-        # print trainable parameters for verification
-        print("Trainable parameters:")
-        for name, param in encoder.named_parameters():
-            if param.requires_grad:
-                print(f"Encoder: {name}")
-        for name, param in decoder.named_parameters():
-            if param.requires_grad:
-                print(f"Decoder: {name}")
-        
         return cls(args, encoder, decoder)
 
     def param_groups(self):
@@ -435,7 +285,7 @@ class SyntaxEnhancedMoeTransformerModel(FairseqEncoderDecoderModel):
             other_params = filter(lambda p: id(p) not in syntax_encoder_params, self.parameters())
             params = [{'params': syntax_encoder_params}, {'params': other_params}]
         return params
-    
+
     @classmethod
     def build_embedding(cls, args, dictionary, embed_dim, path=None):
         num_embeddings = len(dictionary)
@@ -598,58 +448,7 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
                 src_lengths=None,
             )
 
-    def sen_syn(self,o1,o2):
-        if self.args.cross_syntax_fuse:
-            sentence_encoder_out = o1.encoder_out
-            syntax_encoder_out = []
-            for syntax_encoder_out in o2:
-                syntax_encoder_out.append(syntax_encoder_out.encoder_out)
-            return (EncoderOut(
-                encoder_out=sentence_encoder_out,  # T x B x C
-                encoder_padding_mask=o1.encoder_padding_mask,  # B x T
-                encoder_embedding=o1.encoder_embedding,  # B x T x C
-                encoder_states=o1.encoder_states,  # List[T x B x C]
-                src_tokens=None,
-                src_lengths=None,
-            ), EncoderOut(
-                encoder_out=syntax_encoder_out,  # T x B x C
-                encoder_padding_mask=o1.encoder_padding_mask,  # B x T
-                encoder_embedding=o1.encoder_embedding,  # B x T x C
-                encoder_states=o1.encoder_states,  # List[T x B x C]
-                src_tokens=None,
-                src_lengths=None,
-            ))
-        else:
-            sentence_encoder_out = o1.encoder_out
-            if len(o2) == 1:
-                syntax_encoder_out = o2[0].encoder_out
-            elif len(o2) == 2:
-                gate_value = torch.sigmoid(self.fc(torch.cat([o2[0].encoder_out, o2[1].encoder_out], -1))) if getattr(self.args, 'gated_sum', False) else 0.5
-                syntax_encoder_out = gate_value * o2[0].encoder_out + (1 - gate_value) * o2[1].encoder_out
-            else:
-                syntax_encoder_out = o2[0].encoder_out
-                for i in range(1, len(o2)):
-                    syntax_encoder_out = syntax_encoder_out + o2[i].encoder_out
-            if self.training and self.args.scale_syntax_encoder_lr is not None:
-                syntax_encoder_out = GradMultiply.apply(syntax_encoder_out, self.args.scale_syntax_encoder_lr)
-            return (EncoderOut(
-                encoder_out=sentence_encoder_out,  # T x B x C
-                encoder_padding_mask=o1.encoder_padding_mask,  # B x T
-                encoder_embedding=o1.encoder_embedding,  # B x T x C
-                encoder_states=o1.encoder_states,  # List[T x B x C]
-                src_tokens=None,
-                src_lengths=None,
-            ),
-                EncoderOut(
-                encoder_out=syntax_encoder_out,  # T x B x C
-                encoder_padding_mask=o1.encoder_padding_mask,  # B x T
-                encoder_embedding=o1.encoder_embedding,  # B x T x C
-                encoder_states=o1.encoder_states,  # List[T x B x C]
-                src_tokens=None,
-                src_lengths=None,
-            ))
-   
-        
+
     def forward(
         self,
         src_tokens,
@@ -761,14 +560,13 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
                             src_lengths=None,
                         )
                         syntax_encoder_out_all.append(res)  
-            encoder_out = self.sen_syn(sentence_encoder_out, syntax_encoder_out_all)  # 聚集操作，保留原始sentence encoder的信息
-            # encoder_out = (sentence_encoder_out, syntax_encoder_out_all)
+            encoder_out = self.dual_aggregation(sentence_encoder_out, syntax_encoder_out_all, self.args.dual_aggregation_beta)  # 聚集操作，保留原始sentence encoder的信息
             return encoder_out
         else:
             return sentence_encoder_out
  
     @torch.jit.export
-    def reorder_encoder_out(self, encoder_out, new_order):
+    def reorder_encoder_out(self, encoder_out: EncoderOut, new_order):
         """
         Reorder encoder output according to *new_order*.
 
@@ -779,26 +577,21 @@ class SyntaxEnhancedTransformerEncoder(FairseqEncoder):
         Returns:
             *encoder_out* rearranged according to *new_order*
         """
-        if isinstance(encoder_out, tuple) and len(encoder_out) == 2:
-            sentence_encoder_out, syntax_encoder_out = encoder_out
-            reordered_sentence = self.reorder_single_encoder_out(sentence_encoder_out, new_order)
-            reordered_syntax = self.reorder_single_encoder_out(syntax_encoder_out, new_order)
-            return (reordered_sentence, reordered_syntax)
-        else:
-            return self.reorder_single_encoder_out(encoder_out, new_order)
-
-    def reorder_single_encoder_out(self, encoder_out: EncoderOut, new_order):
         """
-        Reorder a single EncoderOut according to *new_order*.
+        Since encoder_padding_mask and encoder_embedding are both of type
+        Optional[Tensor] in EncoderOut, they need to be copied as local
+        variables for Torchscript Optional refinement
         """
         encoder_padding_mask: Optional[Tensor] = encoder_out.encoder_padding_mask
         encoder_embedding: Optional[Tensor] = encoder_out.encoder_embedding
 
-        new_encoder_out = (
-            encoder_out.encoder_out
-            if encoder_out.encoder_out is None
-            else encoder_out.encoder_out.index_select(1, new_order)
-        )
+        if encoder_out.encoder_out is None:
+            new_encoder_out = (encoder_out.encoder_out)
+        elif isinstance(encoder_out.encoder_out, list):
+            new_encoder_out = ([eo.index_select(1, new_order) for eo in encoder_out.encoder_out])
+        else:
+            new_encoder_out = (encoder_out.encoder_out.index_select(1, new_order))
+
         new_encoder_padding_mask = (
             encoder_padding_mask
             if encoder_padding_mask is None
@@ -1451,8 +1244,8 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
             self.layers = nn.ModuleList([])
         self.layers.extend(
             [
-                self.build_decoder_layer(args, no_encoder_attn, idx=i)
-                for i in range(args.decoder_layers)
+                self.build_decoder_layer(args, no_encoder_attn)
+                for _ in range(args.decoder_layers)
             ]
         )
         self.num_layers = len(self.layers)
@@ -1500,16 +1293,11 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
     # def build_decoder_layer(self, args, no_encoder_attn=False):
     #     return TransformerDecoderLayer(args, no_encoder_attn)
     
-    def build_decoder_layer(self, args, no_encoder_attn=False, idx=None):
+    def build_decoder_layer(self, args, no_encoder_attn=False):
         if self.args.cross_syntax_fuse:
             return SynGECTransformerDecoderLayer(args, no_encoder_attn)
-        elif getattr(args, 'moe_num_experts', 0) > 0 or getattr(args, 'use_moe_decoder', False):
-            if idx == 0:
-                return SyntaxTransformerDecoderMoeLayer(args, no_encoder_attn)
-            else:
-                return TransformerDecoderMoeLayer(args, no_encoder_attn)
         else:
-            return TransformerDecoderLayer(args, no_encoder_attn)
+            return TransformerDecoderMoeLayer(args, no_encoder_attn)
 
     def forward(
         self,
@@ -1654,46 +1442,17 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
                 self_attn_mask = self.buffered_future_mask(x)
             else:
                 self_attn_mask = None
-            
-            # Unpack encoder_out if it's a tuple
-            syntax_info = None
-            if isinstance(encoder_out[0], EncoderOut):
-                # print(f"decoder layer{idx} encoder_out is tuple of EncoderOut")
-                # print('len of encoder_out tuple:', len(encoder_out))
-                sentence_encoder_out, syntax_encoder_out_all = encoder_out
-                encoder_out = sentence_encoder_out
-                syntax_info = syntax_encoder_out_all
 
-            # if idx==11:
-            #     print(f"decoder layer{idx} finished processing")
-                
-            encoder_out_arg = encoder_out.encoder_out if encoder_out is not None else None
-            encoder_padding_mask_arg = encoder_out.encoder_padding_mask if encoder_out is not None else None
-
-            # Pass syntax_info to the first layer if available
-            if idx == 0 and syntax_info is not None:
-                x, layer_attn, _ = layer(
-                    x,
-                    encoder_out_arg,
-                    encoder_padding_mask_arg,
-                    incremental_state,
-                    self_attn_mask=self_attn_mask,
-                    self_attn_padding_mask=self_attn_padding_mask,
-                    need_attn=bool((idx == alignment_layer)),
-                    need_head_weights=bool((idx == alignment_layer)),
-                    syntax_info=syntax_info,
-                )
-            else:
-                x, layer_attn, _ = layer(
-                    x,
-                    encoder_out_arg,
-                    encoder_padding_mask_arg,
-                    incremental_state,
-                    self_attn_mask=self_attn_mask,
-                    self_attn_padding_mask=self_attn_padding_mask,
-                    need_attn=bool((idx == alignment_layer)),
-                    need_head_weights=bool((idx == alignment_layer)),
-                )
+            x, layer_attn, _ = layer(
+                x,
+                encoder_out.encoder_out if encoder_out is not None else None,
+                encoder_out.encoder_padding_mask if encoder_out is not None else None,
+                incremental_state,
+                self_attn_mask=self_attn_mask,
+                self_attn_padding_mask=self_attn_padding_mask,
+                need_attn=bool((idx == alignment_layer)),
+                need_head_weights=bool((idx == alignment_layer)),
+            )
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
                 attn = layer_attn.float().to(x)
@@ -1714,13 +1473,7 @@ class SyntaxEnhancedTransformerDecoder(FairseqIncrementalDecoder):
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
-        # Aggregate MoE loss from layers
-        moe_loss = 0.0
-        for layer in self.layers:
-            if hasattr(layer, '_moe_loss'):
-                moe_loss += layer._moe_loss
-
-        return x, {"attn": [attn], "inner_states": inner_states, "moe_loss": moe_loss}
+        return x, {"attn": [attn], "inner_states": inner_states}
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""
@@ -1813,8 +1566,8 @@ def Linear(in_features, out_features, bias=True):
     return m
 
 
-@register_model_architecture("syntax_enhanced_transformer_moe", "syntax_enhanced_transformer_moe")
-def syntax_enhanced_transformer_moe(args):
+@register_model_architecture("syntax_enhanced_transformer", "syntax_enhanced_transformer")
+def syntax_enhanced_transformer(args):
     args.alpha = getattr(args, "alpha'", 1.0)
 
     args.only_dsa = getattr(args, "only_dsa", False)
@@ -1871,8 +1624,8 @@ def syntax_enhanced_transformer_moe(args):
     args.gated_sum = getattr(args, "gated_sum", False)
 
 # default parameters used in tensor2tensor implementation
-@register_model_architecture("syntax_enhanced_transformer_moe", "syntax_enhanced_transformer_moe_big")
-def syntax_enhanced_transformer_moe_big(args):
+@register_model_architecture("syntax_enhanced_transformer", "syntax_enhanced_transformer_big")
+def syntax_enhanced_transformer_big(args):
     args.encoder_layers = getattr(args, "encoder_layers", 12)
     args.decoder_layers = getattr(args, "decoder_layers", 12)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
@@ -1884,4 +1637,4 @@ def syntax_enhanced_transformer_moe_big(args):
     args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
     args.dropout = getattr(args, "dropout", 0.3)
-    syntax_enhanced_transformer_moe(args)
+    syntax_enhanced_transformer(args)

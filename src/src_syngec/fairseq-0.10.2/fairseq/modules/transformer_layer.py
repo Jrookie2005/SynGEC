@@ -1548,7 +1548,10 @@ class TransformerDecoderMoeLayer(nn.Module):
         x_bt = x.transpose(0, 1)
         y_bt = self.moe_ffn(x_bt)
         # Capture MoE aux loss
-        self._moe_loss = getattr(self.moe_ffn.gate, 'aux_loss', 0.0)
+        aux_loss = getattr(self.moe_ffn.gate, 'loss', 0.0)
+        # if aux_loss != 0.0:
+        #     print(f"MoE aux_loss: {aux_loss}")  # Debug aux_loss
+        self._moe_loss = aux_loss
         # Combine with scaling as in common MoE practice
         y_bt = self.moe_scaling * y_bt
         y = y_bt.transpose(0, 1)
@@ -1849,7 +1852,10 @@ class SyntaxTransformerDecoderMoeLayer(nn.Module):
         gate_bt = gate_input.transpose(0, 1)
         y_bt = self.moe_ffn(expert_input = x_bt, gate_input = gate_bt)
         # Capture MoE aux loss
-        self._moe_loss = getattr(self.moe_ffn.gate, 'aux_loss', 0.0)
+        aux_loss = getattr(self.moe_ffn.gate, 'loss', 0.0)
+        if aux_loss != 0.0:
+            print(f"MoE aux_loss: {aux_loss}")  # Debug aux_loss
+        self._moe_loss = aux_loss
         # Combine with scaling as in common MoE practice
         y_bt = self.moe_scaling * y_bt
         y = y_bt.transpose(0, 1)
